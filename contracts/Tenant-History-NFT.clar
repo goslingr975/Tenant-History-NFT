@@ -9,6 +9,11 @@
 (define-constant err-invalid-rating (err u105))
 (define-constant err-not-authorized (err u106))
 (define-constant err-token-not-found (err u107))
+(define-constant err-dispute-not-found (err u108))
+(define-constant err-dispute-closed (err u109))
+(define-constant err-already-voted (err u110))
+(define-constant err-insufficient-escrow (err u111))
+(define-constant err-not-dispute-party (err u112))
 
 (define-data-var token-id-nonce uint u1)
 (define-data-var contract-fee uint u100000)
@@ -61,6 +66,37 @@
 )
 
 (define-data-var listing-id-nonce uint u1)
+(define-data-var dispute-id-nonce uint u1)
+
+(define-map disputes
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        token-id: uint,
+        dispute-type: (string-ascii 64),
+        description: (string-ascii 512),
+        tenant-evidence: (string-ascii 512),
+        landlord-evidence: (string-ascii 512),
+        escrow-amount: uint,
+        tenant-deposited: uint,
+        landlord-deposited: uint,
+        votes-for-tenant: uint,
+        votes-for-landlord: uint,
+        total-voters: uint,
+        status: uint,
+        created-at: uint,
+        resolved-at: uint,
+    }
+)
+
+(define-map dispute-votes
+    {
+        dispute-id: uint,
+        voter: principal,
+    }
+    uint
+)
 
 (define-read-only (get-last-token-id)
     (ok (- (var-get token-id-nonce) u1))
@@ -84,6 +120,10 @@
 
 (define-read-only (get-property-listing (listing-id uint))
     (map-get? property-listings listing-id)
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes dispute-id)
 )
 
 (define-read-only (is-landlord-authorized
@@ -352,6 +392,204 @@
         contract-fee: (var-get contract-fee),
         owner: contract-owner,
     })
+)
+
+(define-public (create-dispute
+        (token-id uint)
+        (dispute-type (string-ascii 64))
+        (description (string-ascii 512))
+        (escrow-amount uint)
+    )
+    (let (
+            (record (unwrap! (map-get? tenant-records token-id) err-token-not-found))
+            (dispute-id (var-get dispute-id-nonce))
+            (tenant-principal (get tenant record))
+            (landlord-principal (get landlord record))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender tenant-principal)
+                (is-eq tx-sender landlord-principal)
+            )
+            err-not-dispute-party
+        )
+        (asserts! (> escrow-amount u0) err-insufficient-escrow)
+
+        (map-set disputes dispute-id {
+            tenant: tenant-principal,
+            landlord: landlord-principal,
+            token-id: token-id,
+            dispute-type: dispute-type,
+            description: description,
+            tenant-evidence: "",
+            landlord-evidence: "",
+            escrow-amount: escrow-amount,
+            tenant-deposited: u0,
+            landlord-deposited: u0,
+            votes-for-tenant: u0,
+            votes-for-landlord: u0,
+            total-voters: u0,
+            status: u1,
+            created-at: stacks-block-height,
+            resolved-at: u0,
+        })
+
+        (var-set dispute-id-nonce (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (deposit-escrow (dispute-id uint))
+    (let (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (escrow-amount (get escrow-amount dispute))
+            (tenant-principal (get tenant dispute))
+            (landlord-principal (get landlord dispute))
+        )
+        (asserts! (is-eq (get status dispute) u1) err-dispute-closed)
+        (asserts!
+            (or
+                (is-eq tx-sender tenant-principal)
+                (is-eq tx-sender landlord-principal)
+            )
+            err-not-dispute-party
+        )
+
+        (try! (stx-transfer? escrow-amount tx-sender (as-contract tx-sender)))
+
+        (if (is-eq tx-sender tenant-principal)
+            (map-set disputes dispute-id
+                (merge dispute { tenant-deposited: escrow-amount })
+            )
+            (map-set disputes dispute-id
+                (merge dispute { landlord-deposited: escrow-amount })
+            )
+        )
+
+        (let ((updated-dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found)))
+            (if (and
+                    (> (get tenant-deposited updated-dispute) u0)
+                    (> (get landlord-deposited updated-dispute) u0)
+                )
+                (begin
+                    (map-set disputes dispute-id
+                        (merge updated-dispute { status: u2 })
+                    )
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (submit-evidence
+        (dispute-id uint)
+        (evidence (string-ascii 512))
+    )
+    (let (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (tenant-principal (get tenant dispute))
+            (landlord-principal (get landlord dispute))
+        )
+        (asserts! (>= (get status dispute) u1) err-dispute-closed)
+        (asserts!
+            (or
+                (is-eq tx-sender tenant-principal)
+                (is-eq tx-sender landlord-principal)
+            )
+            err-not-dispute-party
+        )
+
+        (if (is-eq tx-sender tenant-principal)
+            (map-set disputes dispute-id
+                (merge dispute { tenant-evidence: evidence })
+            )
+            (map-set disputes dispute-id
+                (merge dispute { landlord-evidence: evidence })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute
+        (dispute-id uint)
+        (vote-for-tenant bool)
+    )
+    (let (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (voter-stats (map-get? tenant-stats tx-sender))
+        )
+        (asserts! (is-eq (get status dispute) u2) err-dispute-closed)
+        (asserts! (is-some voter-stats) err-not-authorized)
+        (asserts!
+            (is-none (map-get? dispute-votes {
+                dispute-id: dispute-id,
+                voter: tx-sender,
+            }))
+            err-already-voted
+        )
+
+        (map-set dispute-votes {
+            dispute-id: dispute-id,
+            voter: tx-sender,
+        }
+            (if vote-for-tenant
+                u1
+                u2
+            ))
+
+        (let (
+                (new-tenant-votes (if vote-for-tenant
+                    (+ (get votes-for-tenant dispute) u1)
+                    (get votes-for-tenant dispute)
+                ))
+                (new-landlord-votes (if vote-for-tenant
+                    (get votes-for-landlord dispute)
+                    (+ (get votes-for-landlord dispute) u1)
+                ))
+                (new-total-voters (+ (get total-voters dispute) u1))
+            )
+            (map-set disputes dispute-id
+                (merge dispute {
+                    votes-for-tenant: new-tenant-votes,
+                    votes-for-landlord: new-landlord-votes,
+                    total-voters: new-total-voters,
+                })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (total-votes (get total-voters dispute))
+            (tenant-votes (get votes-for-tenant dispute))
+            (landlord-votes (get votes-for-landlord dispute))
+            (tenant-wins (> tenant-votes landlord-votes))
+            (escrow-amount (get escrow-amount dispute))
+            (total-escrow (* escrow-amount u2))
+            (winner (if tenant-wins
+                (get tenant dispute)
+                (get landlord dispute)
+            ))
+        )
+        (asserts! (is-eq (get status dispute) u2) err-dispute-closed)
+        (asserts! (>= total-votes u3) err-not-authorized)
+
+        (try! (as-contract (stx-transfer? total-escrow tx-sender winner)))
+
+        (map-set disputes dispute-id
+            (merge dispute {
+                status: u3,
+                resolved-at: stacks-block-height,
+            })
+        )
+        (ok tenant-wins)
+    )
 )
 
 (define-public (emergency-pause)
