@@ -14,6 +14,10 @@
 (define-constant err-already-voted (err u110))
 (define-constant err-insufficient-escrow (err u111))
 (define-constant err-not-dispute-party (err u112))
+(define-constant err-review-not-found (err u113))
+(define-constant err-lease-not-ended (err u114))
+(define-constant err-review-already-exists (err u115))
+(define-constant err-invalid-review-rating (err u116))
 
 (define-data-var token-id-nonce uint u1)
 (define-data-var contract-fee uint u100000)
@@ -67,6 +71,7 @@
 
 (define-data-var listing-id-nonce uint u1)
 (define-data-var dispute-id-nonce uint u1)
+(define-data-var review-id-nonce uint u1)
 
 (define-map disputes
     uint
@@ -98,6 +103,53 @@
     uint
 )
 
+;; Tenant Review System Maps
+(define-map property-reviews
+    uint
+    {
+        reviewer: principal,
+        property-address: (string-ascii 256),
+        landlord: principal,
+        token-id: uint,
+        property-rating: uint,
+        landlord-rating: uint,
+        cleanliness-rating: uint,
+        communication-rating: uint,
+        review-text: (string-ascii 512),
+        created-at: uint,
+        verified: bool,
+    }
+)
+
+(define-map landlord-responses
+    uint
+    {
+        landlord: principal,
+        response-text: (string-ascii 512),
+        created-at: uint,
+    }
+)
+
+(define-map property-review-stats
+    (string-ascii 256)
+    {
+        total-reviews: uint,
+        average-property-rating: uint,
+        average-landlord-rating: uint,
+        average-cleanliness-rating: uint,
+        average-communication-rating: uint,
+        verified-reviews: uint,
+    }
+)
+
+(define-map tenant-review-history
+    {
+        tenant: principal,
+        token-id: uint,
+    }
+    uint
+)
+
 (define-read-only (get-last-token-id)
     (ok (- (var-get token-id-nonce) u1))
 )
@@ -124,6 +176,25 @@
 
 (define-read-only (get-dispute (dispute-id uint))
     (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-property-review (review-id uint))
+    (map-get? property-reviews review-id)
+)
+
+(define-read-only (get-landlord-response (review-id uint))
+    (map-get? landlord-responses review-id)
+)
+
+(define-read-only (get-property-review-stats (property-address (string-ascii 256)))
+    (map-get? property-review-stats property-address)
+)
+
+(define-read-only (get-tenant-review-id (tenant principal) (token-id uint))
+    (map-get? tenant-review-history {
+        tenant: tenant,
+        token-id: token-id,
+    })
 )
 
 (define-read-only (is-landlord-authorized
@@ -596,5 +667,192 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (ok true)
+    )
+)
+
+;; Tenant Review System Functions
+(define-public (submit-property-review
+        (token-id uint)
+        (property-rating uint)
+        (landlord-rating uint)
+        (cleanliness-rating uint)
+        (communication-rating uint)
+        (review-text (string-ascii 512))
+    )
+    (let (
+            (record (unwrap! (map-get? tenant-records token-id) err-token-not-found))
+            (review-id (var-get review-id-nonce))
+            (tenant-principal (get tenant record))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender tenant-principal) err-not-authorized)
+        (asserts! (> current-block (get lease-end record)) err-lease-not-ended)
+        (asserts!
+            (is-none (map-get? tenant-review-history {
+                tenant: tenant-principal,
+                token-id: token-id,
+            }))
+            err-review-already-exists
+        )
+        (asserts! (and (>= property-rating u1) (<= property-rating u10))
+            err-invalid-review-rating
+        )
+        (asserts! (and (>= landlord-rating u1) (<= landlord-rating u10))
+            err-invalid-review-rating
+        )
+        (asserts! (and (>= cleanliness-rating u1) (<= cleanliness-rating u10))
+            err-invalid-review-rating
+        )
+        (asserts! (and (>= communication-rating u1) (<= communication-rating u10))
+            err-invalid-review-rating
+        )
+
+        (map-set property-reviews review-id {
+            reviewer: tenant-principal,
+            property-address: (get property-address record),
+            landlord: (get landlord record),
+            token-id: token-id,
+            property-rating: property-rating,
+            landlord-rating: landlord-rating,
+            cleanliness-rating: cleanliness-rating,
+            communication-rating: communication-rating,
+            review-text: review-text,
+            created-at: current-block,
+            verified: false,
+        })
+
+        (map-set tenant-review-history {
+            tenant: tenant-principal,
+            token-id: token-id,
+        }
+            review-id
+        )
+
+        (update-property-review-stats
+            (get property-address record)
+            property-rating
+            landlord-rating
+            cleanliness-rating
+            communication-rating
+            false
+        )
+
+        (var-set review-id-nonce (+ review-id u1))
+        (ok review-id)
+    )
+)
+
+(define-public (respond-to-review
+        (review-id uint)
+        (response-text (string-ascii 512))
+    )
+    (let (
+            (review (unwrap! (map-get? property-reviews review-id) err-review-not-found))
+            (landlord-principal (get landlord review))
+        )
+        (asserts! (is-eq tx-sender landlord-principal) err-not-authorized)
+        (asserts!
+            (is-none (map-get? landlord-responses review-id))
+            err-already-exists
+        )
+
+        (map-set landlord-responses review-id {
+            landlord: landlord-principal,
+            response-text: response-text,
+            created-at: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (verify-property-review (review-id uint))
+    (let ((review (unwrap! (map-get? property-reviews review-id) err-review-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (not (get verified review)) err-already-exists)
+
+        (map-set property-reviews review-id (merge review { verified: true }))
+
+        (let (
+                (property-address (get property-address review))
+                (current-stats (default-to {
+                    total-reviews: u0,
+                    average-property-rating: u0,
+                    average-landlord-rating: u0,
+                    average-cleanliness-rating: u0,
+                    average-communication-rating: u0,
+                    verified-reviews: u0,
+                }
+                    (map-get? property-review-stats property-address)
+                ))
+            )
+            (map-set property-review-stats property-address
+                (merge current-stats { verified-reviews: (+ (get verified-reviews current-stats) u1) })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-property-review-stats
+        (property-address (string-ascii 256))
+        (property-rating uint)
+        (landlord-rating uint)
+        (cleanliness-rating uint)
+        (communication-rating uint)
+        (verified bool)
+    )
+    (let (
+            (current-stats (default-to {
+                total-reviews: u0,
+                average-property-rating: u0,
+                average-landlord-rating: u0,
+                average-cleanliness-rating: u0,
+                average-communication-rating: u0,
+                verified-reviews: u0,
+            }
+                (map-get? property-review-stats property-address)
+            ))
+            (new-total-reviews (+ (get total-reviews current-stats) u1))
+            (new-verified (if verified
+                (+ (get verified-reviews current-stats) u1)
+                (get verified-reviews current-stats)
+            ))
+            (current-prop-avg (get average-property-rating current-stats))
+            (current-landlord-avg (get average-landlord-rating current-stats))
+            (current-clean-avg (get average-cleanliness-rating current-stats))
+            (current-comm-avg (get average-communication-rating current-stats))
+            (new-prop-avg (if (is-eq (get total-reviews current-stats) u0)
+                property-rating
+                (/ (+ (* current-prop-avg (get total-reviews current-stats)) property-rating)
+                    new-total-reviews
+                )
+            ))
+            (new-landlord-avg (if (is-eq (get total-reviews current-stats) u0)
+                landlord-rating
+                (/ (+ (* current-landlord-avg (get total-reviews current-stats)) landlord-rating)
+                    new-total-reviews
+                )
+            ))
+            (new-clean-avg (if (is-eq (get total-reviews current-stats) u0)
+                cleanliness-rating
+                (/ (+ (* current-clean-avg (get total-reviews current-stats)) cleanliness-rating)
+                    new-total-reviews
+                )
+            ))
+            (new-comm-avg (if (is-eq (get total-reviews current-stats) u0)
+                communication-rating
+                (/ (+ (* current-comm-avg (get total-reviews current-stats)) communication-rating)
+                    new-total-reviews
+                )
+            ))
+        )
+        (map-set property-review-stats property-address {
+            total-reviews: new-total-reviews,
+            average-property-rating: new-prop-avg,
+            average-landlord-rating: new-landlord-avg,
+            average-cleanliness-rating: new-clean-avg,
+            average-communication-rating: new-comm-avg,
+            verified-reviews: new-verified,
+        })
     )
 )
