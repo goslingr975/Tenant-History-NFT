@@ -190,7 +190,10 @@
     (map-get? property-review-stats property-address)
 )
 
-(define-read-only (get-tenant-review-id (tenant principal) (token-id uint))
+(define-read-only (get-tenant-review-id
+        (tenant principal)
+        (token-id uint)
+    )
     (map-get? tenant-review-history {
         tenant: tenant,
         token-id: token-id,
@@ -703,7 +706,8 @@
         (asserts! (and (>= cleanliness-rating u1) (<= cleanliness-rating u10))
             err-invalid-review-rating
         )
-        (asserts! (and (>= communication-rating u1) (<= communication-rating u10))
+        (asserts!
+            (and (>= communication-rating u1) (<= communication-rating u10))
             err-invalid-review-rating
         )
 
@@ -728,13 +732,9 @@
             review-id
         )
 
-        (update-property-review-stats
-            (get property-address record)
-            property-rating
-            landlord-rating
-            cleanliness-rating
-            communication-rating
-            false
+        (update-property-review-stats (get property-address record)
+            property-rating landlord-rating cleanliness-rating
+            communication-rating false
         )
 
         (var-set review-id-nonce (+ review-id u1))
@@ -751,8 +751,7 @@
             (landlord-principal (get landlord review))
         )
         (asserts! (is-eq tx-sender landlord-principal) err-not-authorized)
-        (asserts!
-            (is-none (map-get? landlord-responses review-id))
+        (asserts! (is-none (map-get? landlord-responses review-id))
             err-already-exists
         )
 
@@ -823,25 +822,37 @@
             (current-comm-avg (get average-communication-rating current-stats))
             (new-prop-avg (if (is-eq (get total-reviews current-stats) u0)
                 property-rating
-                (/ (+ (* current-prop-avg (get total-reviews current-stats)) property-rating)
+                (/
+                    (+ (* current-prop-avg (get total-reviews current-stats))
+                        property-rating
+                    )
                     new-total-reviews
                 )
             ))
             (new-landlord-avg (if (is-eq (get total-reviews current-stats) u0)
                 landlord-rating
-                (/ (+ (* current-landlord-avg (get total-reviews current-stats)) landlord-rating)
+                (/
+                    (+ (* current-landlord-avg (get total-reviews current-stats))
+                        landlord-rating
+                    )
                     new-total-reviews
                 )
             ))
             (new-clean-avg (if (is-eq (get total-reviews current-stats) u0)
                 cleanliness-rating
-                (/ (+ (* current-clean-avg (get total-reviews current-stats)) cleanliness-rating)
+                (/
+                    (+ (* current-clean-avg (get total-reviews current-stats))
+                        cleanliness-rating
+                    )
                     new-total-reviews
                 )
             ))
             (new-comm-avg (if (is-eq (get total-reviews current-stats) u0)
                 communication-rating
-                (/ (+ (* current-comm-avg (get total-reviews current-stats)) communication-rating)
+                (/
+                    (+ (* current-comm-avg (get total-reviews current-stats))
+                        communication-rating
+                    )
                     new-total-reviews
                 )
             ))
